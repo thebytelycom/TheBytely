@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { HttpError } from './errors.js';
 import { clean, cleanMultiline } from './validate.js';
 import { ADDONS, PACKAGES, calcTotals } from './pricing.js';
-
+import { sendEnquiryEmail } from './mailer.js';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const dataDir = () => process.env.DATA_DIR || path.join(here, '..', 'data');
 const file = () => path.join(dataDir(), 'enquiries.jsonl');
@@ -44,14 +44,27 @@ export function validateEnquiry(raw) {
   return { enquiry, totals };
 }
 
+async function writeToFile(record) {
+  await mkdir(dataDir(), { recursive: true });
+  await appendFile(file(), JSON.stringify(record) + '\n', 'utf8');
+}
+
+// An enquiry is kept in two places: emailed to the owner and saved to a file.
+// It only counts as received if at least one of them worked.
 export async function saveEnquiry(payload) {
   const { enquiry, totals } = validateEnquiry(payload && payload.enquiry);
   const record = { id: randomUUID(), receivedAt: new Date().toISOString(), ...enquiry, totals };
-  await mkdir(dataDir(), { recursive: true });
-  await appendFile(file(), JSON.stringify(record) + '\n', 'utf8');
+
+  const [mail, saved] = await Promise.allSettled([sendEnquiryEmail(record), writeToFile(record)]);
+  const emailed = mail.status === 'fulfilled' && mail.value.sent === true;
+  const stored = saved.status === 'fulfilled';
+  if (!stored) console.error('[enquiry] could not save to file:', saved.reason && saved.reason.message);
+
+  if (!emailed && !stored) {
+    throw new HttpError(500, 'enquiry_not_saved', 'We could not save your enquiry right now. Please use "Copy summary" and send it to us directly.');
+  }
   return { ok: true, id: record.id, totals };
 }
-
 export async function listEnquiries() {
   try {
     const text = await readFile(file(), 'utf8');
